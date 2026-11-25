@@ -1,4 +1,4 @@
-module github.com/sidharth/agy-session-helper
+module github.com/Sidharth-Prabhu/antigravity-session-helper
 
 go 1.26.2
 

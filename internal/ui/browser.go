@@ -10,10 +10,10 @@ import (
 
 	"golang.org/x/term"
 
-	"github.com/sidharth/agy-session-helper/internal/antigravity"
-	"github.com/sidharth/agy-session-helper/internal/config"
-	"github.com/sidharth/agy-session-helper/internal/db"
-	"github.com/sidharth/agy-session-helper/internal/runner"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/antigravity"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/config"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/db"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/runner"
 )
 
 // StartInteractiveBrowser launches the terminal session selector.

@@ -4,13 +4,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
-	"github.com/sidharth/agy-session-helper/internal/antigravity"
-	"github.com/sidharth/agy-session-helper/internal/config"
-	"github.com/sidharth/agy-session-helper/internal/db"
-	"github.com/sidharth/agy-session-helper/internal/runner"
-	"github.com/sidharth/agy-session-helper/internal/ui"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/antigravity"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/config"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/db"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/runner"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/ui"
 )
 
 const version = "1.0.0"
@@ -29,10 +30,10 @@ func main() {
 	}
 	defer store.Close()
 
-	binName := filepath.Base(os.Args[0])
+	binName := strings.TrimSuffix(strings.ToLower(filepath.Base(os.Args[0])), ".exe")
 	args := os.Args[1:]
 
-	// If invoked directly as 'agy' (e.g. via symlink or alias)
+	// If invoked directly as 'agy' (e.g. via symlink, wrapper, or renamed binary)
 	if binName == "agy" {
 		if len(args) == 0 {
 			// Without arguments, launch interactive browser
@@ -207,9 +208,64 @@ func importSessions(cfg *config.Config, store *db.Store) {
 }
 
 func installShellIntegration() {
-	home, _ := os.UserHomeDir()
-	zshrc := filepath.Join(home, ".zshrc")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Could not determine user home directory: %v\n", err)
+		return
+	}
 
+	if runtime.GOOS == "windows" {
+		installWindowsPowerShellIntegration(home)
+		return
+	}
+
+	installUnixShellIntegration(home)
+}
+
+func installWindowsPowerShellIntegration(home string) {
+	psSnippet := `
+# --- Antigravity CLI Helper Integration ---
+function agy {
+    if ($args.Count -eq 0) {
+        & agy-session-helper.exe
+    } else {
+        & agy-session-helper.exe exec @args
+    }
+}
+# ------------------------------------------
+`
+	candidates := []string{
+		filepath.Join(home, "Documents", "PowerShell", "Microsoft.PowerShell_profile.ps1"),
+		filepath.Join(home, "Documents", "WindowsPowerShell", "Microsoft.PowerShell_profile.ps1"),
+	}
+
+	installed := false
+	for _, profilePath := range candidates {
+		content, _ := os.ReadFile(profilePath)
+		if strings.Contains(string(content), "Antigravity CLI Helper Integration") {
+			fmt.Printf("PowerShell integration is already installed in %s!\n", profilePath)
+			return
+		}
+
+		_ = os.MkdirAll(filepath.Dir(profilePath), 0755)
+		f, err := os.OpenFile(profilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err == nil {
+			_, _ = f.WriteString(psSnippet)
+			_ = f.Close()
+			fmt.Printf("✓ Successfully added PowerShell integration to %s!\n", profilePath)
+			fmt.Println("Restart your PowerShell terminal or run: . $PROFILE")
+			installed = true
+			break
+		}
+	}
+
+	if !installed {
+		fmt.Println("Could not automatically locate PowerShell profile. Add this snippet to your $PROFILE:")
+		fmt.Println(psSnippet)
+	}
+}
+
+func installUnixShellIntegration(home string) {
 	snippet := `
 # --- Antigravity CLI Helper Integration ---
 agy() {
@@ -221,30 +277,40 @@ agy() {
 }
 # ------------------------------------------
 `
-
-	// Check if already in ~/.zshrc
-	content, _ := os.ReadFile(zshrc)
-	if strings.Contains(string(content), "Antigravity CLI Helper Integration") {
-		fmt.Println("Shell integration is already installed in ~/.zshrc!")
-		return
+	targets := []string{
+		filepath.Join(home, ".zshrc"),
+		filepath.Join(home, ".bashrc"),
 	}
 
-	f, err := os.OpenFile(zshrc, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Printf("Could not open %s for writing: %v\n", zshrc, err)
-		fmt.Println("You can manually add this snippet to your shell configuration file:")
+	installedCount := 0
+	for _, target := range targets {
+		content, err := os.ReadFile(target)
+		if err != nil && !os.IsNotExist(err) {
+			continue
+		}
+		if strings.Contains(string(content), "Antigravity CLI Helper Integration") {
+			fmt.Printf("Shell integration is already installed in %s!\n", target)
+			installedCount++
+			continue
+		}
+
+		f, err := os.OpenFile(target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			continue
+		}
+		if _, err := f.WriteString(snippet); err == nil {
+			fmt.Printf("✓ Successfully added shell integration to %s!\n", target)
+			installedCount++
+		}
+		_ = f.Close()
+	}
+
+	if installedCount > 0 {
+		fmt.Println("Run: source ~/.zshrc (or source ~/.bashrc) to activate in current terminal.")
+	} else {
+		fmt.Println("Add this snippet to your shell profile (~/.zshrc, ~/.bashrc, or ~/.profile):")
 		fmt.Println(snippet)
-		return
 	}
-	defer f.Close()
-
-	if _, err := f.WriteString(snippet); err != nil {
-		fmt.Printf("Error writing to %s: %v\n", zshrc, err)
-		return
-	}
-
-	fmt.Printf("✓ Successfully added shell integration to %s!\n", zshrc)
-	fmt.Println("Run: source ~/.zshrc (or restart your terminal) to activate.")
 }
 
 func printHelp() {

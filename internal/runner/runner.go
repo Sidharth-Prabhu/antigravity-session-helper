@@ -11,9 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sidharth/agy-session-helper/internal/antigravity"
-	"github.com/sidharth/agy-session-helper/internal/config"
-	"github.com/sidharth/agy-session-helper/internal/db"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/antigravity"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/config"
+	"github.com/Sidharth-Prabhu/antigravity-session-helper/internal/db"
 )
 
 // NonInteractiveSubcommands are agy subcommands that don't produce persistent interactive chat sessions.
@@ -85,7 +85,7 @@ func RunAgy(cfg *config.Config, store *db.Store, args []string, workingDir strin
 
 	// Forward signals to child process
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigChan)
 
 	if err := cmd.Start(); err != nil {
