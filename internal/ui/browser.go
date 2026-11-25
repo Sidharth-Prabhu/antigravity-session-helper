@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"strings"
@@ -106,138 +107,324 @@ func runRawModeBrowser(sessions []db.Session) (string, *db.Session, error) {
 	}
 	defer term.Restore(fd, oldState)
 
+	// Enter alternate screen buffer & hide cursor for zero-flicker rendering
+	os.Stdout.WriteString("\033[?1049h\033[?25l")
+	defer os.Stdout.WriteString("\033[?25h\033[?1049l")
+
 	selectedIndex := 0
+	scrollOffset := 0
 	filterText := ""
 	isFiltering := false
 
+	buf := make([]byte, 64)
+
 	for {
-		filtered := filterSessions(sessions, filterText)
-		if selectedIndex >= len(filtered) {
-			selectedIndex = max(0, len(filtered)-1)
+		termWidth, termHeight, err := term.GetSize(fd)
+		if err != nil || termWidth <= 0 || termHeight <= 0 {
+			termWidth = 100
+			termHeight = 25
 		}
 
-		renderScreen(filtered, selectedIndex, filterText, isFiltering)
+		filtered := filterSessions(sessions, filterText)
+		if len(filtered) == 0 {
+			selectedIndex = 0
+			scrollOffset = 0
+		} else {
+			if selectedIndex >= len(filtered) {
+				selectedIndex = len(filtered) - 1
+			}
+			if selectedIndex < 0 {
+				selectedIndex = 0
+			}
+		}
 
-		// Read key
-		buf := make([]byte, 3)
+		// Fixed lines:
+		// Header box: 3 lines
+		// Status / filter line: 2 lines
+		// Table header: 1 line
+		// Footer separator + help line: 2 lines
+		// Total fixed: 8 lines
+		visibleRows := termHeight - 8
+		if visibleRows < 3 {
+			visibleRows = 3
+		}
+
+		// Adjust scroll offset to keep selectedIndex in viewport
+		if selectedIndex < scrollOffset {
+			scrollOffset = selectedIndex
+		} else if selectedIndex >= scrollOffset+visibleRows {
+			scrollOffset = selectedIndex - visibleRows + 1
+		}
+		if scrollOffset < 0 {
+			scrollOffset = 0
+		}
+		if maxOffset := len(filtered) - visibleRows; maxOffset >= 0 && scrollOffset > maxOffset {
+			scrollOffset = maxOffset
+		}
+
+		renderScreenFlickerFree(filtered, selectedIndex, scrollOffset, visibleRows, filterText, isFiltering, termWidth, termHeight)
+
 		n, err := os.Stdin.Read(buf)
 		if err != nil {
 			return "quit", nil, err
 		}
+		if n == 0 {
+			continue
+		}
 
-		if n == 1 {
-			b := buf[0]
-			if isFiltering {
-				switch b {
-				case 13: // Enter
-					isFiltering = false
-				case 27: // Esc
+		// Check for escape sequences
+		if buf[0] == 27 {
+			if n == 1 {
+				// Single Esc key
+				if isFiltering {
 					isFiltering = false
 					filterText = ""
-				case 127, 8: // Backspace
-					if len(filterText) > 0 {
-						filterText = filterText[:len(filterText)-1]
-					}
-				case 3: // Ctrl+C
+				} else {
 					return "quit", nil, nil
-				default:
-					if b >= 32 && b <= 126 {
-						filterText += string(b)
-					}
 				}
 				continue
 			}
 
-			// Normal Navigation Mode
+			// Arrow keys & special keys (ANSI / VT100 / xterm)
+			if n >= 3 && (buf[1] == '[' || buf[1] == 'O') {
+				switch buf[2] {
+				case 'A': // Up Arrow
+					if selectedIndex > 0 {
+						selectedIndex--
+					}
+					continue
+				case 'B': // Down Arrow
+					if selectedIndex < len(filtered)-1 {
+						selectedIndex++
+					}
+					continue
+				case 'H': // Home
+					selectedIndex = 0
+					continue
+				case 'F': // End
+					if len(filtered) > 0 {
+						selectedIndex = len(filtered) - 1
+					}
+					continue
+				}
+
+				if n >= 4 && buf[1] == '[' && buf[3] == '~' {
+					switch buf[2] {
+					case '5': // Page Up
+						selectedIndex -= visibleRows
+						if selectedIndex < 0 {
+							selectedIndex = 0
+						}
+						continue
+					case '6': // Page Down
+						selectedIndex += visibleRows
+						if selectedIndex >= len(filtered) {
+							selectedIndex = max(0, len(filtered)-1)
+						}
+						continue
+					case '1', '7': // Home
+						selectedIndex = 0
+						continue
+					case '4', '8': // End
+						if len(filtered) > 0 {
+							selectedIndex = len(filtered) - 1
+						}
+						continue
+					case '3': // Delete key
+						if !isFiltering && len(filtered) > 0 {
+							return "delete", &filtered[selectedIndex], nil
+						}
+					}
+				}
+			}
+			continue
+		}
+
+		b := buf[0]
+
+		if isFiltering {
 			switch b {
-			case 3, 'q', 'Q': // Ctrl+C or q
+			case 13: // Enter: finish typing filter
+				isFiltering = false
+			case 127, 8: // Backspace
+				if len(filterText) > 0 {
+					filterText = filterText[:len(filterText)-1]
+					selectedIndex = 0
+					scrollOffset = 0
+				}
+			case 3: // Ctrl+C
 				return "quit", nil, nil
-			case 13: // Enter
-				if len(filtered) > 0 {
-					return "open", &filtered[selectedIndex], nil
-				}
-			case 'k', 'K': // Up
-				if selectedIndex > 0 {
-					selectedIndex--
-				}
-			case 'j', 'J': // Down
-				if selectedIndex < len(filtered)-1 {
-					selectedIndex++
-				}
-			case 'n', 'N': // New session
-				return "new", nil, nil
-			case 'd', 'D': // Delete session
-				if len(filtered) > 0 {
-					return "delete", &filtered[selectedIndex], nil
-				}
-			case 'r', 'R': // Rename
-				if len(filtered) > 0 {
-					return "rename", &filtered[selectedIndex], nil
-				}
-			case 'i', 'I': // Import
-				return "import", nil, nil
-			case '/': // Search
-				isFiltering = true
-			}
-		} else if n == 3 && buf[0] == 27 && buf[1] == 91 {
-			// ANSI escape sequences
-			switch buf[2] {
-			case 65: // Up Arrow
-				if selectedIndex > 0 {
-					selectedIndex--
-				}
-			case 66: // Down Arrow
-				if selectedIndex < len(filtered)-1 {
-					selectedIndex++
+			default:
+				if b >= 32 && b <= 126 {
+					filterText += string(b)
+					selectedIndex = 0
+					scrollOffset = 0
 				}
 			}
+			continue
+		}
+
+		// Normal Navigation Mode
+		switch b {
+		case 3, 'q', 'Q': // Ctrl+C or q
+			return "quit", nil, nil
+		case 13: // Enter
+			if len(filtered) > 0 {
+				return "open", &filtered[selectedIndex], nil
+			}
+		case 'k', 'K': // Up
+			if selectedIndex > 0 {
+				selectedIndex--
+			}
+		case 'j', 'J': // Down
+			if selectedIndex < len(filtered)-1 {
+				selectedIndex++
+			}
+		case 'g': // Top (vim style)
+			selectedIndex = 0
+		case 'G': // Bottom (vim style)
+			if len(filtered) > 0 {
+				selectedIndex = len(filtered) - 1
+			}
+		case 'n', 'N': // New session
+			return "new", nil, nil
+		case 'd', 'D': // Delete session
+			if len(filtered) > 0 {
+				return "delete", &filtered[selectedIndex], nil
+			}
+		case 'r', 'R': // Rename
+			if len(filtered) > 0 {
+				return "rename", &filtered[selectedIndex], nil
+			}
+		case 'i', 'I': // Import
+			return "import", nil, nil
+		case '/': // Search
+			isFiltering = true
 		}
 	}
 }
 
-func renderScreen(sessions []db.Session, selected int, filter string, isFiltering bool) {
-	// Clear screen & home cursor
-	fmt.Print("\033[2J\033[H")
+func renderScreenFlickerFree(
+	sessions []db.Session,
+	selected int,
+	offset int,
+	visibleRows int,
+	filter string,
+	isFiltering bool,
+	termWidth int,
+	termHeight int,
+) {
+	var b bytes.Buffer
 
-	fmt.Print("\033[1;36m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\r\n\033[0m")
-	fmt.Print("\033[1;36m┃                         ANTIGRAVITY CLI SESSION HELPER                           ┃\r\n\033[0m")
-	fmt.Print("\033[1;36m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\r\n\033[0m")
+	// Move cursor to top-left (no clear screen = no flashing)
+	b.WriteString("\033[H")
 
+	// Header box
+	headerTitle := "ANTIGRAVITY CLI SESSION HELPER"
+	b.WriteString("\033[1;36m┏" + strings.Repeat("━", max(10, termWidth-2)) + "┓\033[0m\033[K\r\n")
+	pad := max(0, (termWidth-2-len(headerTitle))/2)
+	b.WriteString(fmt.Sprintf("\033[1;36m┃%s\033[1;37m%s\033[1;36m%s┃\033[0m\033[K\r\n",
+		strings.Repeat(" ", pad),
+		headerTitle,
+		strings.Repeat(" ", max(0, termWidth-2-pad-len(headerTitle)))))
+	b.WriteString("\033[1;36m┗" + strings.Repeat("━", max(10, termWidth-2)) + "┛\033[0m\033[K\r\n")
+
+	// Filter / Status line
 	if isFiltering {
-		fmt.Printf(" \033[1;33m[Search]:\033[0m %s\033[5m█\033[0m (Press Enter to finish, Esc to clear)\r\n\r\n", filter)
+		b.WriteString(fmt.Sprintf(" \033[1;33m[Search]:\033[0m %s\033[5m█\033[0m \033[2m(Enter to finish, Esc to clear)\033[0m\033[K\r\n\r\n", filter))
 	} else if filter != "" {
-		fmt.Printf(" \033[1;33m[Filtered by]:\033[0m %s (Press '/' to edit, 'Esc' in search to clear)\r\n\r\n", filter)
+		b.WriteString(fmt.Sprintf(" \033[1;33m[Filter]:\033[0m %s \033[2m(Press '/' to edit, Esc to clear)\033[0m\033[K\r\n\r\n", filter))
 	} else {
-		fmt.Print(" \033[2mSelect a session to resume with Antigravity CLI\033[0m\r\n\r\n")
+		countStr := fmt.Sprintf("(%d saved sessions)", len(sessions))
+		b.WriteString(fmt.Sprintf(" \033[2mSelect a session to resume with Antigravity CLI %s\033[0m\033[K\r\n\r\n", countStr))
 	}
 
+	// Calculate responsive column widths
+	// Total available width minus padding (approx 4 chars left + spaces between cols)
+	availWidth := termWidth - 16
+	if availWidth < 40 {
+		availWidth = 40
+	}
+	nameWidth := max(18, availWidth*38/100)
+	pathWidth := max(20, availWidth*48/100)
+	timeWidth := 12
+
 	// Table header
-	fmt.Print("   \033[1;4m#   SESSION NAME                   PROJECT WORKSPACE              LAST ACTIVE\033[0m\r\n")
+	headerLine := fmt.Sprintf("   \033[1;4m%-4s %-*s %-*s %-*s\033[0m",
+		"#",
+		nameWidth, "SESSION NAME",
+		pathWidth, "PROJECT WORKSPACE",
+		timeWidth, "LAST ACTIVE")
+	b.WriteString(headerLine + "\033[K\r\n")
 
 	if len(sessions) == 0 {
-		fmt.Print("\r\n    \033[33mNo sessions matching filter.\033[0m\r\n\r\n")
+		b.WriteString("\r\n    \033[33mNo sessions matching filter.\033[0m\033[K\r\n")
+		// Fill remaining visible rows
+		for r := 1; r < visibleRows; r++ {
+			b.WriteString("\033[K\r\n")
+		}
 	} else {
-		for i, s := range sessions {
+		endIdx := min(offset+visibleRows, len(sessions))
+		renderedRows := 0
+
+		for i := offset; i < endIdx; i++ {
+			s := sessions[i]
+			renderedRows++
+
 			cursor := "  "
 			colorPrefix := ""
 			colorSuffix := "\033[0m"
 
 			if i == selected {
 				cursor = "\033[1;32m❯ \033[0m"
-				colorPrefix = "\033[1;32m"
+				colorPrefix = "\033[1;32;48;5;236m"
+				colorSuffix = "\033[0m"
 			}
 
-			name := truncateStr(s.Name, 30)
-			path := formatPath(s.ProjectPath, 30)
+			name := truncateStr(s.Name, nameWidth)
+			path := formatPath(s.ProjectPath, pathWidth)
 			relTime := formatRelativeTime(s.UpdatedAt)
 
-			fmt.Printf("%s%s%-3d %-30s %-30s %-12s%s\r\n",
-				cursor, colorPrefix, i+1, name, path, relTime, colorSuffix)
+			rowStr := fmt.Sprintf("%s%s%-4d %-*s %-*s %-*s%s",
+				cursor,
+				colorPrefix,
+				i+1,
+				nameWidth, name,
+				pathWidth, path,
+				timeWidth, relTime,
+				colorSuffix)
+
+			b.WriteString(rowStr + "\033[K\r\n")
+		}
+
+		// Fill remaining empty rows in viewport so cursor doesn't jump
+		for r := renderedRows; r < visibleRows; r++ {
+			b.WriteString("\033[K\r\n")
 		}
 	}
 
-	fmt.Print("\r\n\033[2m──────────────────────────────────────────────────────────────────────────────────\033[0m\r\n")
-	fmt.Print(" \033[1m[Enter]\033[0m Open   \033[1m[n]\033[0m New Session   \033[1m[d]\033[0m Delete   \033[1m[r]\033[0m Rename   \033[1m[/]\033[0m Search   \033[1m[q]\033[0m Quit\r\n")
+	// Scroll position indicator
+	scrollInfo := ""
+	if len(sessions) > visibleRows {
+		scrollInfo = fmt.Sprintf(" [%d-%d of %d] ", offset+1, min(offset+visibleRows, len(sessions)), len(sessions))
+	}
+	sepLen := max(0, termWidth-len(scrollInfo)-2)
+	b.WriteString("\033[2m" + strings.Repeat("─", sepLen/2) + "\033[1;33m" + scrollInfo + "\033[0;2m" + strings.Repeat("─", (sepLen+1)/2) + "\033[0m\033[K\r\n")
+
+	// Footer hotkeys
+	b.WriteString(" \033[1m[Enter]\033[0m Open  \033[1m[↑/↓]\033[0m Nav  \033[1m[n]\033[0m New  \033[1m[d]\033[0m Delete  \033[1m[r]\033[0m Rename  \033[1m[/]\033[0m Search  \033[1m[q]\033[0m Quit\033[K")
+
+	// Clear anything below footer
+	b.WriteString("\033[J")
+
+	if isFiltering {
+		b.WriteString("\033[?25h") // Show cursor in filter mode
+	} else {
+		b.WriteString("\033[?25l") // Hide cursor in browse mode
+	}
+
+	// Write entire frame in a single atomic syscall
+	_, _ = os.Stdout.Write(b.Bytes())
 }
 
 func filterSessions(sessions []db.Session, query string) []db.Session {
@@ -436,6 +623,13 @@ func formatRelativeTime(t time.Time) string {
 		return fmt.Sprintf("%dd ago", int(diff.Hours()/24))
 	}
 	return t.Format("Jan 02")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func max(a, b int) int {
